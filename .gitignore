@@ -1,0 +1,38 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Fichiers générés par le pipeline
+meteo_weekly.csv
+synop_hebdo.csv
+synop_hebdo_enrichi.csv
+synop_hebdo_google_enrichi.csv
+synop_hebdo_complet.csv
+train_enrichi.csv
+test_enrichi.csv
+submissions/
+
+# CatBoost
+catboost_info/

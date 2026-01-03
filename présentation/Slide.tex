@@ -1,0 +1,683 @@
+\documentclass[10pt]{beamer}
+
+% =========================
+% Langue & encodage
+% =========================
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+
+% =========================
+% Mise en page & typo
+% =========================
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% =========================
+% Maths
+% =========================
+\usepackage{amsmath, amssymb}
+
+% =========================
+% Images & tableaux
+% =========================
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+
+% =========================
+% Code (listings)
+% =========================
+\usepackage{xcolor}
+\usepackage{listings}
+
+% Style Python (simple et lisible)
+\lstdefinestyle{python}{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{purple!70!black},
+  showstringspaces=false,
+  upquote=true,
+  tabsize=2
+}
+\lstset{style=python}
+
+% =========================
+% Beamer theme
+% =========================
+\usetheme{Madrid}
+\usecolortheme{default}
+
+% =========================
+% Infos document
+% =========================
+\title[MACHINE LEARNING]{MACHINE LEARNING}
+\subtitle{Prévision du taux de grippe par région en France}
+\institute{Master M2 -- MoSEF}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% =========================
+% TABLE DES MATIÈRES
+% =========================
+\begin{frame}{Plan de la présentation}
+\tableofcontents
+\end{frame}
+
+% =============================================================================
+% SECTION 1 : INTRODUCTION
+% =============================================================================
+\section{Introduction}
+
+\begin{frame}{Contexte et objectif}
+\begin{itemize}
+    \item \textbf{Objectif :} Prédire le \textbf{taux de grippe hebdomadaire} (pour 100 000 habitants) par région en France.
+    
+    \medskip
+    \item \textbf{Métrique :} RMSE (Root Mean Squared Error)
+    
+    \medskip
+    \item \textbf{Données disponibles :}
+    \begin{itemize}
+        \item Données météorologiques SYNOP (154 fichiers, granularité horaire)
+        \item Google Trends (22 régions, granularité mensuelle)
+        \item Population INSEE (granularité annuelle)
+        \item Fichiers train/test avec taux de grippe hebdomadaire
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Défi principal :} Harmoniser des sources de données à \textbf{granularités différentes} (horaire, mensuel, annuel) vers une granularité \textbf{hebdomadaire}.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Pipeline global}
+\centering
+\textbf{Vue d'ensemble du traitement des données}
+
+\medskip
+\begin{tabular}{ccc}
+\textbf{Source} & \textbf{Granularité} & \textbf{Transformation} \\
+\midrule
+SYNOP (météo) & Horaire & Agrégation hebdomadaire \\
+$\downarrow$ & & \\
+Google Trends & Mensuel & Forward fill \\
+$\downarrow$ & & \\
+Population INSEE & Annuel & Interpolation spline \\
+$\downarrow$ & & \\
+\multicolumn{3}{c}{\fbox{\texttt{train\_enrichi.csv} / \texttt{test\_enrichi.csv}}} \\
+$\downarrow$ & & \\
+\multicolumn{3}{c}{\textbf{Modèle CatBoost (V12)}} \\
+\end{tabular}
+\end{frame}
+
+% =============================================================================
+% SECTION 2 : PRÉPARATION DES DONNÉES
+% =============================================================================
+\section{Préparation des données}
+
+\subsection{Agrégation météorologique (SYNOP)}
+
+\begin{frame}{Étape 1 : Agrégation SYNOP (horaire $\rightarrow$ hebdomadaire)}
+\begin{itemize}
+    \item \textbf{Objectif :} Transformer 154 fichiers SYNOP (observations horaires par station) en \textbf{variables hebdomadaires par région}.
+
+    \medskip
+    \item \textbf{Pourquoi c'est important :}
+    \begin{itemize}
+        \item \textbf{Alignement d'échelle} : le modèle prédit par région/semaine
+        \item \textbf{Réduction du bruit} : l'horaire est volatile, l'hebdo stabilise
+        \item \textbf{Comparabilité} : même règle pour toutes les régions
+    \end{itemize}
+
+    \medskip
+    \item \textbf{Features créées :}
+    \begin{itemize}
+        \item \texttt{temp\_mean}, \texttt{temp\_min}, \texttt{temp\_max}
+        \item \texttt{humidity\_mean}, \texttt{wind\_speed\_max}
+        \item \texttt{precipitation\_sum}
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Sortie :} \texttt{meteo\_weekly.csv}
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Mapping station $\rightarrow$ région}
+\small
+\textbf{Problème :} Les données SYNOP sont par \textbf{station}, pas par région.
+
+\medskip
+\textbf{Solution :} Mapping manuel + fallback par coordonnées géographiques.
+
+\begin{lstlisting}
+def get_region_from_coords(lat, lon, station_id=None):
+    if station_id and station_id in MANUAL_STATION_MAPPING:
+        return MANUAL_STATION_MAPPING[station_id]
+    # fallback: regles lat/lon (approx)
+    ...
+
+df["region_code"] = df["numer_sta"].map(station_to_region)
+df = df[df["region_code"].notna()]
+\end{lstlisting}
+
+\medskip
+\textbf{Agrégation hebdomadaire :}
+\begin{lstlisting}
+df["week"] = df["datetime"].apply(get_week_id)  # YYYYWW
+weekly_df = df.groupby(["week", "region_code"]).agg(agg_dict)
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Défi 1 : Franche-Comté (aucune station météo)}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\textbf{Problème :}
+\begin{itemize}
+    \item Aucune station SYNOP en Franche-Comté
+    \item Impossible de calculer les features météo
+\end{itemize}
+
+\medskip
+\textbf{Options considérées :}
+\begin{enumerate}
+    \item Imputer avec moyenne des régions voisines
+    \item Utiliser la station la plus proche
+\end{enumerate}
+
+\medskip
+\textbf{Solution retenue :}
+\begin{itemize}
+    \item Station \textbf{Bâle-Mulhouse} (frontalière)
+    \item Justification : continuité spatiale de la météo
+\end{itemize}
+\end{column}
+\begin{column}{0.45\textwidth}
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Région} & \textbf{Stations} \\
+\midrule
+Alsace & 2 \\
+Lorraine & 1 \\
+Bourgogne & 1 \\
+\textcolor{red}{\textbf{Franche-Comté}} & \textcolor{red}{\textbf{0}} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+$\downarrow$
+
+\begin{lstlisting}[basicstyle=\ttfamily\tiny]
+MANUAL_STATION_MAPPING = {
+  "07299": "FRANCHE-COMTE"
+  # Bale-Mulhouse
+}
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+\subsection{Fusion avec Google Trends}
+
+\begin{frame}{Étape 2 : Fusion avec Google Trends (mensuel $\rightarrow$ hebdomadaire)}
+\begin{itemize}
+    \item \textbf{Objectif :} Enrichir les données météo avec les recherches Google "grippe".
+    
+    \medskip
+    \item \textbf{Difficulté :} Granularités différentes
+    \begin{itemize}
+        \item Météo : \textbf{hebdomadaire} (clé \texttt{YYYYWW})
+        \item Google : \textbf{mensuel} (clé \texttt{YYYY-MM})
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Solution :} Convertir semaine ISO en mois (via le jeudi de la semaine)
+    
+    \medskip
+    \item \textbf{Features Google :}
+    \begin{itemize}
+        \item \texttt{google\_grippe} : volume brut
+        \item \texttt{google\_grippe\_no\_aviaire} : sans "grippe aviaire"
+        \item \texttt{google\_grippe\_filtered} : filtré (sans H1N1, aviaire, etc.)
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Sortie :} \texttt{synop\_hebdo\_google\_enrichi.csv}
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Alignement temporel : semaine $\rightarrow$ mois}
+\small
+\textbf{Principe :} Le jeudi ancre la semaine ISO (standard).
+
+\begin{lstlisting}
+def week_to_month(week_id):
+    year = week_id // 100
+    week = week_id % 100
+    jan4 = datetime(year, 1, 4)
+    week1_monday = jan4 - timedelta(days=jan4.weekday())
+    target_monday = week1_monday + timedelta(weeks=week - 1)
+    target_thursday = target_monday + timedelta(days=3)
+    return target_thursday.strftime("%Y-%m")
+
+synop["month"] = synop["week"].apply(week_to_month)
+merged = synop.merge(google_df, on=["month", "region_name"], how="left")
+\end{lstlisting}
+
+\medskip
+\textbf{Harmonisation des noms de régions :}
+\begin{lstlisting}
+FILENAME_TO_REGION = {
+  "IledeFrance": "ILE-DE-FRANCE",
+  "ProvenceAlpesCotedAzur": "PROVENCE-ALPES-COTE-D-AZUR",
+  ...
+}
+\end{lstlisting}
+\end{frame}
+
+\subsection{Ajout des données de population}
+
+\begin{frame}{Étape 3 : Population INSEE (annuel $\rightarrow$ hebdomadaire)}
+\begin{itemize}
+    \item \textbf{Objectif :} Ajouter des indicateurs démographiques par région.
+    
+    \medskip
+    \item \textbf{Pourquoi c'est important :}
+    \begin{itemize}
+        \item \textbf{Effet taille} : plus de population = plus de cas potentiels
+        \item \textbf{Effet composition} : la grippe touche différemment selon l'âge
+        \item \textbf{Contrôle structurel} : séparer démographie vs météo/comportement
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Difficulté :} Données \textbf{annuelles} vs granularité \textbf{hebdomadaire}
+    
+    \medskip
+    \item \textbf{Solution :} Interpolation \textbf{spline cubique}
+    \begin{itemize}
+        \item Trajectoire lisse et réaliste
+        \item Pas de "sauts" artificiels (vs forward-fill)
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Sortie :} \texttt{synop\_hebdo\_complet.csv}
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Interpolation spline cubique}
+\small
+\begin{lstlisting}
+from scipy.interpolate import CubicSpline
+
+# Points d'ancrage : 1er janvier de chaque annee
+anchor_dates = [datetime(year, 1, 1) for year in region_data["year"]]
+anchor_numeric = [date_to_numeric(d) for d in anchor_dates]
+
+# Spline cubique (extrapolation autorisee)
+spline = CubicSpline(anchor_numeric, values, extrapolate=True)
+
+# Interpoler pour chaque semaine
+week_date = week_to_date(week_id)  # jeudi ISO
+pop_week = float(spline(date_to_numeric(week_date)))
+\end{lstlisting}
+
+\medskip
+\textbf{Features dérivées :}
+\begin{lstlisting}
+merged["pop_ratio_elderly"] = (
+    merged["pop_60_74"] + merged["pop_75_plus"]
+) / merged["pop_total"]
+\end{lstlisting}
+
+\medskip
+\textbf{Avantage spline vs forward-fill :} Évite l'effet "escalier" non réaliste.
+\end{frame}
+
+\subsection{Traitement des valeurs manquantes}
+
+\begin{frame}{Défi 2 : Traitement des valeurs manquantes}
+\begin{tabular}{p{3cm}p{3cm}p{4cm}}
+\toprule
+\textbf{Type de donnée} & \textbf{Méthode} & \textbf{Justification} \\
+\midrule
+Météo (temp, humidité) & Médiane & Robuste aux outliers \\
+\addlinespace
+Google Trends & Valeur 0 & Absence = pas d'intérêt \\
+\addlinespace
+Lags (1ère semaine) & Médiane globale & Évite NaN en début de série \\
+\addlinespace
+Features historiques & Médiane par région & Conserve distribution locale \\
+\addlinespace
+Prédictions & Clip à 0 & Taux négatif impossible \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\textbf{Principe général :}
+\begin{itemize}
+    \item \textbf{Médiane} plutôt que moyenne $\Rightarrow$ robustesse aux outliers
+    \item \textbf{Imputation contextuelle} (par région/semaine quand possible)
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Défi 3 : Outlier 2009 (Pandémie H1N1)}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\textbf{Constat :}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Année} & \textbf{Moyenne} & \textbf{Max} \\
+\midrule
+2004 & 22 & 675 \\
+2005 & 95 & 1855 \\
+2006 & 60 & 1235 \\
+2007 & 73 & 1444 \\
+2008 & 75 & 1416 \\
+\textcolor{red}{\textbf{2009}} & \textcolor{red}{\textbf{191}} & \textcolor{red}{\textbf{2478}} \\
+2010 & 30 & 569 \\
+2011 & 72 & 1573 \\
+\bottomrule
+\end{tabular}
+\end{column}
+\begin{column}{0.5\textwidth}
+\textbf{Impact :}
+\begin{itemize}
+    \item Moyenne \textbf{3× plus élevée}
+    \item Maximum historique absolu
+    \item Risque d'overfitting
+\end{itemize}
+
+\medskip
+\textbf{Stratégie retenue :}
+\begin{itemize}
+    \item \textbf{Non exclusion} (garder l'info)
+    \item \textbf{Régularisation forte}
+    \item Alternative testée : exclure 2009
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+% =============================================================================
+% SECTION 3 : MODÉLISATION
+% =============================================================================
+\section{Modélisation}
+
+\begin{frame}{Modèle V12 : vision globale}
+\begin{itemize}
+    \item \textbf{Algorithme :} CatBoostRegressor (gradient boosting)
+    
+    \medskip
+    \item \textbf{Contraintes du problème :}
+    \begin{itemize}
+        \item Forte \textbf{auto-corrélation temporelle} (effet mémoire)
+        \item \textbf{Saisonnalité marquée} (pics hivernaux)
+        \item Hétérogénéité \textbf{régionale}
+        \item Risque d'\textbf{overfitting} (peu d'années)
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Choix méthodologiques :}
+    \begin{itemize}
+        \item Sélection de \textbf{15 features} (sur 50+ disponibles)
+        \item \textbf{Régularisation forte}
+        \item \textbf{Validation temporelle} (dernière année complète)
+    \end{itemize}
+    
+    \medskip
+    \item \textbf{Idée centrale :} La grippe est un phénomène \textbf{dynamique} dont l'évolution dépend fortement de son \textbf{passé récent}.
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Feature Engineering : lags et saisonnalité}
+\small
+\textbf{1) Mémoire épidémique (lags)}
+\begin{lstlisting}
+train["taux_lag1"] = train.groupby("region_code")["TauxGrippe"].shift(1)
+train["taux_lag2"] = train.groupby("region_code")["TauxGrippe"].shift(2)
+train["taux_diff1"] = train["taux_lag1"] - train["taux_lag2"]
+\end{lstlisting}
+
+\textbf{Interprétation :}
+\begin{itemize}
+    \item \texttt{taux\_lag1} : inertie immédiate
+    \item \texttt{taux\_diff1} : accélération/ralentissement
+\end{itemize}
+
+\medskip
+\textbf{2) Saisonnalité explicite}
+\begin{lstlisting}
+df["sin_1"] = sin(2*pi*week_num/52)
+df["cos_1"] = cos(2*pi*week_num/52)
+df["is_flu_season"] = (week_num <= 12) | (week_num >= 45)
+\end{lstlisting}
+
+\textbf{Pourquoi :} Encodage continu (sin/cos) + régime binaire hiver.
+\end{frame}
+
+\begin{frame}[fragile]{Feature Engineering : contexte régional et Google}
+\small
+\textbf{1) Historique régional (profil saisonnier)}
+\begin{lstlisting}
+agg = hist.groupby(["region_code","week_num"])["TauxGrippe"].agg(
+    ["mean","median","std","max"]
+)
+df = df.merge(agg, on=["region_code","week_num"], how="left")
+\end{lstlisting}
+
+\textbf{Lecture :}
+\begin{itemize}
+    \item \texttt{rw\_max} : intensité maximale typique
+    \item \texttt{rw\_std} : volatilité habituelle
+\end{itemize}
+
+\medskip
+\textbf{2) Google Trends (signal comportemental)}
+\begin{lstlisting}
+df["google_log"] = log1p(df["google_grippe_filtered"])
+df["google_x_rw"] = df["google_log"] * df["rw_mean"]
+\end{lstlisting}
+
+\textbf{Pourquoi :} Volume de recherche = proxy de perception sanitaire.
+
+\medskip
+\textbf{3) Interactions clés}
+\begin{lstlisting}
+df["lag1_x_season"] = df["taux_lag1"] * df["is_flu_season"]
+df["lag1_x_google"] = df["taux_lag1"] * df["google_log"]
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Les 15 features sélectionnées}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\begin{tabular}{lr}
+\toprule
+\textbf{Feature} & \textbf{Importance} \\
+\midrule
+\texttt{lag1\_x\_season} & 28.0\% \\
+\texttt{taux\_lag1} & 18.7\% \\
+\texttt{lag1\_x\_google} & 14.2\% \\
+\texttt{rw\_max} & 12.2\% \\
+\texttt{rw\_std} & 8.9\% \\
+\midrule
+\textit{Top 5} & \textit{82\%} \\
+\midrule
+\texttt{taux\_diff1} & 5.6\% \\
+\texttt{google\_log} & 2.3\% \\
+\texttt{taux\_lag2} & 2.0\% \\
+\texttt{...} & ... \\
+\bottomrule
+\end{tabular}
+\end{column}
+\begin{column}{0.5\textwidth}
+\textbf{Observation clé :}
+\begin{itemize}
+    \item \textbf{5 features} font \textbf{82\%} du travail
+    \item L'inertie temporelle domine
+    \item Les 10 autres : $<$18\% combinées
+\end{itemize}
+
+\medskip
+\textbf{Conclusion :}\\
+Modèle simple avec features bien choisies > modèle complexe
+\end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Stratégie anti-overfitting}
+\small
+\textbf{1) Validation temporelle stricte (pas de fuite)}
+\begin{lstlisting}
+train_f["year"] = train_f["week"].astype(str).str[:4]
+train = data[year < max_year]  # 2004-2010
+val   = data[year == max_year] # 2011
+\end{lstlisting}
+
+\medskip
+\textbf{2) Régularisation forte du modèle}
+\begin{lstlisting}
+CatBoostRegressor(
+    depth=4,              # arbres peu profonds
+    l2_leaf_reg=12,       # penalisation L2
+    min_data_in_leaf=60,  # feuilles larges
+    bagging_temperature=0.8,
+    early_stopping_rounds=25
+)
+\end{lstlisting}
+
+\medskip
+\textbf{Effet :}
+\begin{itemize}
+    \item Arbres peu profonds $\Rightarrow$ règles simples
+    \item Feuilles larges $\Rightarrow$ moins sensible au bruit
+\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Prédiction récursive}
+\small
+\textbf{Problème :} En production, les valeurs passées du test sont inconnues.
+
+\medskip
+\textbf{Solution :} Prédiction semaine par semaine, en utilisant les prédictions précédentes.
+
+\begin{lstlisting}
+for week in test_weeks:
+    # Utiliser les predictions precedentes comme lags
+    week_data["taux_lag1"] = week_data["region_code"].map(last_pred)
+    week_data["taux_lag2"] = week_data["region_code"].map(second_last_pred)
+    
+    # Predire
+    pred_week = model.predict(week_data[features])
+    
+    # Mettre a jour les lags pour la semaine suivante
+    second_last_pred[region] = last_pred[region]
+    last_pred[region] = pred_week
+\end{lstlisting}
+
+\medskip
+\textbf{Risque :} Propagation des erreurs $\Rightarrow$ importance de la régularisation.
+\end{frame}
+
+% =============================================================================
+% SECTION 4 : RÉSULTATS
+% =============================================================================
+\section{Résultats}
+
+\begin{frame}{Évolution des modèles}
+\textbf{Observation surprenante :} Plus de features $\Rightarrow$ \textbf{pire} score Kaggle
+
+\medskip
+\begin{tabular}{lccc}
+\toprule
+\textbf{Version} & \textbf{Features} & \textbf{Val RMSE} & \textbf{Kaggle RMSE} \\
+\midrule
+V7 (baseline) & 18 & 58 & $\sim$100 \\
+V10 (+ régularisation) & 18 & 68 & 91 \\
+\textbf{V12 (sélection)} & \textbf{15} & \textbf{69} & \textbf{88} \\
+V13 (minimal) & 11 & 69 & -- \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\textbf{Leçons apprises :}
+\begin{itemize}
+    \item Val RMSE bas $\neq$ bon score Kaggle (\textbf{overfitting})
+    \item \textbf{Régularisation} : indispensable pour généraliser
+    \item \textbf{Moins de features} : plus robuste
+    \item \textbf{Validation réaliste} : année complète (pas split 80/20)
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Résultat final}
+\centering
+\Large
+
+\textbf{Modèle V12}
+
+\medskip
+\begin{tabular}{ll}
+\toprule
+Algorithme & CatBoostRegressor \\
+Features & 15 \\
+Validation RMSE & 69 \\
+\textbf{Kaggle RMSE} & \textbf{88} \\
+\bottomrule
+\end{tabular}
+
+\vspace{1cm}
+
+\normalsize
+\textbf{Clé du succès :}\\
+Simplicité + Régularisation forte + Validation temporelle
+\end{frame}
+
+% =============================================================================
+% SECTION 5 : CONCLUSION
+% =============================================================================
+\section{Conclusion}
+
+\begin{frame}{Synthèse et enseignements}
+\textbf{Pipeline complet :}
+\begin{enumerate}
+    \item Agrégation SYNOP (horaire $\rightarrow$ hebdo)
+    \item Fusion Google Trends (mensuel $\rightarrow$ hebdo)
+    \item Interpolation population (annuel $\rightarrow$ hebdo, spline cubique)
+    \item Feature engineering (lags, saisonnalité, interactions)
+    \item Modèle CatBoost régularisé (15 features)
+\end{enumerate}
+
+\medskip
+\textbf{Enseignements clés :}
+\begin{itemize}
+    \item \textbf{Qualité des données} > quantité de features
+    \item \textbf{Régularisation} essentielle pour généraliser
+    \item \textbf{Validation temporelle} réaliste (pas de fuite)
+    \item Le \textbf{lag t-1} reste le meilleur prédicteur (inertie épidémique)
+\end{itemize}
+
+\medskip
+\textbf{Défis surmontés :}
+Franche-Comté (pas de station) • Granularités hétérogènes • Outlier 2009
+\end{frame}
+
+\begin{frame}
+\centering
+\Huge \textbf{Merci !}
+
+\vspace{1cm}
+\Large Questions ?
+\end{frame}
+
+\end{document}
