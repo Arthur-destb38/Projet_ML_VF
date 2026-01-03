@@ -23,14 +23,38 @@ VF_projet/
 └── NoteBook_resume_explicatif.ipynb  # Notebook explicatif
 ```
 
-## Installation
+## Installation Rapide (Recommandé)
+
+### Mac / Linux
+```bash
+chmod +x setup.sh
+./setup.sh install
+./setup.sh run
+```
+
+### Windows (PowerShell)
+```powershell
+# Autoriser l'exécution de scripts (une seule fois, en admin)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# Installer et lancer
+.\setup.ps1 install
+.\setup.ps1 run
+```
+
+> **Note**: Python 3.9, 3.10, 3.11 ou 3.12 requis (CatBoost non compatible avec Python 3.13+)
+
+---
+
+## Installation Manuelle
 
 ### 1. Creer l'environnement virtuel
 
 ```bash
 cd VF_projet
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Mac/Linux
+# OU: .\venv\Scripts\Activate.ps1  # Windows PowerShell
 ```
 
 ### 2. Installer les dependances
